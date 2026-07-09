@@ -1,17 +1,16 @@
 import json
 import os
+import re
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
+# Direct integration with AI Pipe using your environment variable token
 client = OpenAI(
-    api_key=os.environ["OPENROUTER_API_KEY"],
-    base_url=os.environ.get(
-        "OPENROUTER_BASE_URL",
-        "https://openrouter.ai/api/v1"
-    )
+    api_key=os.environ.get("AIPIPE_TOKEN"),
+    base_url="https://aipipe.org/openrouter/v1"
 )
 
 app = FastAPI(title="Dynamic Schema Extraction API")
@@ -27,7 +26,7 @@ app.add_middleware(
 
 class DynamicRequest(BaseModel):
     text: str
-    schema: dict
+    schema: dict  # Example: {"customer_name": "string", "quantity": "integer"}
 
 
 @app.get("/")
@@ -35,83 +34,111 @@ def home():
     return {"status": "running"}
 
 
-def default_value(dtype):
-
-    return None
-
-
 @app.post("/dynamic-extract")
 def dynamic_extract(req: DynamicRequest):
 
-    prompt = f"""
-You are a structured information extraction engine.
+    # 1. TRANSLATE CUSTOM SHORTHAND SCHEMA INTO COMPLIANT JSON SCHEMA
+    type_map = {
+        "string": "string",
+        "date": "string",
+        "integer": "integer",
+        "float": "number",
+        "boolean": "boolean"
+    }
 
-Extract ONLY the fields requested.
+    properties = {}
+    required_keys = []
 
-TEXT
+    for key, val in req.schema.items():
+        inferred_type = type_map.get(str(val).lower(), "string")
+        
+        # We append "null" so strict validation allows missing fields gracefully
+        properties[key] = {
+            "type": [inferred_type, "null"]
+        }
+        
+        if str(val).lower() == "date":
+            properties[key]["description"] = "ISO date string formatted strictly as YYYY-MM-DD"
+        elif str(val).lower() == "integer":
+            properties[key]["description"] = "A raw number integer value"
+        elif str(val).lower() == "float":
+            properties[key]["description"] = "A floating point numeric decimal value"
+            
+        required_keys.append(key)
 
-{req.text}
+    openai_compatible_schema = {
+        "type": "object",
+        "properties": properties,
+        "required": required_keys,
+        "additionalProperties": False
+    }
 
-SCHEMA
-
-{json.dumps(req.schema, indent=2)}
-
-Rules
-
-1. Return ONLY valid JSON.
-2. Return EXACTLY the keys in the schema.
-3. No extra keys.
-4. If a value cannot be found return null.
-5. Dates MUST be YYYY-MM-DD.
-6. integer -> JSON integer
-7. float -> JSON number
-8. boolean -> true/false
-9. array[string] -> JSON array of strings
-10. array[integer] -> JSON array of integers
-
-Return ONLY JSON.
-"""
-
+    # 2. CALL LLM WITH NATIVE STRUCTURED SCHEMA OVERRIDE
     try:
-
         response = client.chat.completions.create(
-
-            model="openrouter/free",
-
+            model="google/gemini-2.5-flash",
             temperature=0,
-
             response_format={
-                "type": "json_object"
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "DynamicExtraction",
+                    "strict": True,
+                    "schema": openai_compatible_schema
+                }
             },
-
             messages=[
                 {
+                    "role": "system",
+                    "content": (
+                        "You are an expert structured data parser. Extract fields requested by the schema. "
+                        "Crucial rule: Any field labeled as a date MUST be parsed and output as a "
+                        "strict YYYY-MM-DD string value. If an implicit date string or conversational description "
+                        "is encountered, calculate or resolve it down to its exact target format."
+                    )
+                },
+                {
                     "role": "user",
-                    "content": prompt
+                    "content": f"Text to extract from:\n{req.text}"
                 }
-            ]
+            ],
         )
 
-        text = response.choices[0].message.content
-
-        result = json.loads(text)
-
-        final = {}
-
-        for key in req.schema:
-
-            if key in result:
-                final[key] = result[key]
-            else:
-                final[key] = None
-
-        return final
-
+        text_output = response.choices[0].message.content
+        data = json.loads(text_output)
     except Exception as e:
+        print(f"Extraction failed: {e}")
+        data = {}
 
-        print(e)
+    # 3. TYPE CASTING & CORRECTIONS PIPELINE
+    final_output = {}
+    for key, expected_type in req.schema.items():
+        raw_val = data.get(key, None)
+        expected_type_lower = str(expected_type).lower()
 
-        return {
-            key: None
-            for key in req.schema
-        }
+        if raw_val is None or str(raw_val).lower() == "null":
+            final_output[key] = None
+            continue
+
+        try:
+            if expected_type_lower == "integer":
+                final_output[key] = int(float(raw_val))
+            elif expected_type_lower == "float":
+                final_output[key] = float(raw_val)
+            elif expected_type_lower == "boolean":
+                if str(raw_val).lower() in ["true", "1", "yes"]:
+                    final_output[key] = True
+                elif str(raw_val).lower() in ["false", "0", "no"]:
+                    final_output[key] = False
+                else:
+                    final_output[key] = bool(raw_val)
+            elif expected_type_lower == "date":
+                # Ensure spacing is stripped from date extractions
+                final_output[key] = str(raw_val).strip()
+            else:
+                final_output[key] = str(raw_val)
+        except Exception:
+            # Fall back safely to null if cast operations hit formatting anomalies
+            final_output[key] = None
+
+    # 4. GUARANTEE COMPLIANCE AND EXACT KEY SEQUENCING
+    return {key: final_output.get(key, None) for key in req.schema}

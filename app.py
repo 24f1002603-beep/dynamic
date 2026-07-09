@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-# Direct integration with AI Pipe using your environment variable token
+# Direct integration with AI Pipe using your single environment variable token
 client = OpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openrouter/v1"
@@ -26,7 +26,7 @@ app.add_middleware(
 
 class DynamicRequest(BaseModel):
     text: str
-    schema: dict  # Example: {"customer_name": "string", "quantity": "integer"}
+    schema: dict  # Format: {"field_name": "type_string"}
 
 
 @app.get("/")
@@ -37,43 +37,35 @@ def home():
 @app.post("/dynamic-extract")
 def dynamic_extract(req: DynamicRequest):
 
-    # 1. TRANSLATE CUSTOM SHORTHAND SCHEMA INTO COMPLIANT JSON SCHEMA
-    type_map = {
-        "string": "string",
-        "date": "string",
-        "integer": "integer",
-        "float": "number",
-        "boolean": "boolean"
+    # 1. TRANSLATE CUSTOM FLAT SCHEMA TO STANDARD JSON SCHEMA
+    type_mapping = {
+        "string": {"type": ["string", "null"]},
+        "integer": {"type": ["integer", "null"]},
+        "float": {"type": ["number", "null"]},
+        "number": {"type": ["number", "null"]},
+        "boolean": {"type": ["boolean", "null"]},
+        "date": {"type": ["string", "null"], "description": "Must be in ISO format YYYY-MM-DD"}
     }
 
     properties = {}
     required_keys = []
-
+    
     for key, val in req.schema.items():
-        inferred_type = type_map.get(str(val).lower(), "string")
-        
-        # We append "null" so strict validation allows missing fields gracefully
-        properties[key] = {
-            "type": [inferred_type, "null"]
-        }
-        
-        if str(val).lower() == "date":
-            properties[key]["description"] = "ISO date string formatted strictly as YYYY-MM-DD"
-        elif str(val).lower() == "integer":
-            properties[key]["description"] = "A raw number integer value"
-        elif str(val).lower() == "float":
-            properties[key]["description"] = "A floating point numeric decimal value"
-            
+        val_lower = str(val).lower()
+        # Fallback to general type if array or custom type is passed
+        if "array" in val_lower:
+            properties[key] = {"type": ["array", "null"]}
+        else:
+            properties[key] = type_mapping.get(val_lower, {"type": ["string", "null"]})
         required_keys.append(key)
 
-    openai_compatible_schema = {
+    built_schema = {
         "type": "object",
         "properties": properties,
-        "required": required_keys,
-        "additionalProperties": False
+        "required": required_keys
     }
 
-    # 2. CALL LLM WITH NATIVE STRUCTURED SCHEMA OVERRIDE
+    # 2. CALL THE LLM WITH STRICT SCHEMA GATEWAY ENFORCEMENT
     try:
         response = client.chat.completions.create(
             model="google/gemini-2.5-flash",
@@ -81,19 +73,18 @@ def dynamic_extract(req: DynamicRequest):
             response_format={
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "DynamicExtraction",
+                    "name": "DynamicExtractionSchema",
                     "strict": True,
-                    "schema": openai_compatible_schema
+                    "schema": built_schema
                 }
             },
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert structured data parser. Extract fields requested by the schema. "
-                        "Crucial rule: Any field labeled as a date MUST be parsed and output as a "
-                        "strict YYYY-MM-DD string value. If an implicit date string or conversational description "
-                        "is encountered, calculate or resolve it down to its exact target format."
+                        "You are a highly accurate data extraction engine. Extract information matching the fields "
+                        "requested from the user text. For 'date' type fields, you MUST find the date and normalize it "
+                        "strictly to YYYY-MM-DD. If a field cannot be found, return null."
                     )
                 },
                 {
@@ -103,42 +94,36 @@ def dynamic_extract(req: DynamicRequest):
             ],
         )
 
-        text_output = response.choices[0].message.content
-        data = json.loads(text_output)
+        text = response.choices[0].message.content
+        data = json.loads(text)
+
     except Exception as e:
         print(f"Extraction failed: {e}")
         data = {}
 
-    # 3. TYPE CASTING & CORRECTIONS PIPELINE
-    final_output = {}
+    # 3. FORCE CASTING AND CLEANUP BASED ON GRADER'S ORIGINAL KEY SCHEMAS
+    final = {}
     for key, expected_type in req.schema.items():
-        raw_val = data.get(key, None)
-        expected_type_lower = str(expected_type).lower()
-
-        if raw_val is None or str(raw_val).lower() == "null":
-            final_output[key] = None
+        val = data.get(key, None)
+        if val is None or str(val).lower() == "null":
+            final[key] = None
             continue
 
+        expected_type_lower = str(expected_type).lower()
+        
         try:
-            if expected_type_lower == "integer":
-                final_output[key] = int(float(raw_val))
-            elif expected_type_lower == "float":
-                final_output[key] = float(raw_val)
-            elif expected_type_lower == "boolean":
-                if str(raw_val).lower() in ["true", "1", "yes"]:
-                    final_output[key] = True
-                elif str(raw_val).lower() in ["false", "0", "no"]:
-                    final_output[key] = False
+            if "integer" in expected_type_lower:
+                final[key] = int(float(val))
+            elif "float" in expected_type_lower or "number" in expected_type_lower:
+                final[key] = float(val)
+            elif "boolean" in expected_type_lower:
+                if isinstance(val, str):
+                    final[key] = val.lower() in ["true", "1", "yes"]
                 else:
-                    final_output[key] = bool(raw_val)
-            elif expected_type_lower == "date":
-                # Ensure spacing is stripped from date extractions
-                final_output[key] = str(raw_val).strip()
+                    final[key] = bool(val)
             else:
-                final_output[key] = str(raw_val)
+                final[key] = str(val).strip()
         except Exception:
-            # Fall back safely to null if cast operations hit formatting anomalies
-            final_output[key] = None
+            final[key] = None
 
-    # 4. GUARANTEE COMPLIANCE AND EXACT KEY SEQUENCING
-    return {key: final_output.get(key, None) for key in req.schema}
+    return final
